@@ -3675,7 +3675,6 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 # to sit at 17-40 queued packets (0.7-1.6s of audio) as a
                 # standing backlog that never drains -- see --audio_q_backpressure.
                 AUDIO_Q_BACKPRESS = max(1, int(getattr(args, "audio_q_backpressure", 96)))
-                FRAME_Q_PUT_TIMEOUT_S = 120.0
                 prebuffer_chunks = max(0, int(getattr(args, "prebuffer_chunks", PREBUFFER_CHUNKS)))
                 hidden_steps_per_chunk = int(getattr(args, "reply_hidden_steps_per_chunk", 0))
                 if hidden_steps_per_chunk <= 0:
@@ -3686,8 +3685,47 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 assistant_gate_hold = 0
                 last_motion_frame: torch.Tensor | None = None
 
+                def _safe_put_nowait(q: "asyncio.Queue", pkt: dict, label: str) -> None:
+                    """Runs ON THE EVENT LOOP THREAD via call_soon_threadsafe (see
+                    below) -- never call directly from the GPU thread. put_nowait
+                    is synchronous and non-blocking, so this returns immediately
+                    once scheduled; it does not wait for a sender to drain
+                    anything. QueueFull is only possible if several packets get
+                    enqueued within one backpressure-checked GPU-thread iteration
+                    (the check runs once per iteration, not once per packet) --
+                    caught and logged, never raised into the event loop."""
+                    try:
+                        q.put_nowait(pkt)
+                    except asyncio.QueueFull:
+                        print(
+                            f"[GPU] WARNING {label} full at put_nowait, dropped "
+                            f"frame={pkt.get('frame_number')} (qsize={q.qsize()})",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[GPU] WARNING {label} put_nowait failed: {e!r}", flush=True)
+
                 def _enqueue_frame(pkt: dict) -> None:
-                    """Block until frame_q accepts pkt (real backpressure). Must run from GPU thread."""
+                    """Hand pkt to frame_q without blocking the GPU thread.
+
+                    Forensic fix: this used to be
+                    `asyncio.run_coroutine_threadsafe(frame_q.put(pkt), event_loop).result(timeout=...)`,
+                    which blocks the GPU producer thread until the asyncio EVENT
+                    LOOP THREAD actually gets around to running that coroutine.
+                    The event loop spends most of its time inside
+                    `await asyncio.sleep(...)` in the paced audio/video senders,
+                    so every single frame/audio enqueue could stall the GPU
+                    thread for however long the event loop happened to be
+                    mid-sleep -- invisible to every CUDA-side stage timer, and a
+                    direct cause of the avatar-motion backlog growing
+                    unpredictably regardless of measured per-chunk GPU cost.
+                    call_soon_threadsafe + put_nowait is the standard
+                    non-blocking, thread-safe way to hand data to an asyncio
+                    queue from another thread; it is safe here specifically
+                    because the FRAME_Q_BACKPRESS/AUDIO_Q_BACKPRESS wait loops
+                    above already keep the queue under its cap before this is
+                    called, so put_nowait normally cannot fail.
+                    """
                     _pkt_turn = pkt.get("turn_id")
                     # t_ready was already stamped in render_and_encode_subbatch
                     # at the moment render+JPEG-encode finished -- surface the
@@ -3696,18 +3734,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     reply_engine._mark_first_per_turn(
                         "server_avatar_frame_ready", _pkt_turn, at=pkt.get("t_ready"),
                     )
-                    fut = asyncio.run_coroutine_threadsafe(frame_q.put(pkt), event_loop)
-                    try:
-                        fut.result(timeout=FRAME_Q_PUT_TIMEOUT_S)
-                    except TimeoutError:
-                        print(
-                            f"[GPU] WARNING frame_q.put timeout frame={pkt.get('frame_number')}",
-                            flush=True,
-                        )
-                    except Exception as e:
-                        print(f"[GPU] WARNING frame_q.put failed: {e!r}", flush=True)
+                    event_loop.call_soon_threadsafe(_safe_put_nowait, frame_q, pkt, "frame_q")
 
                 def _enqueue_audio(pkt: dict) -> None:
+                    """Hand pkt to audio_q without blocking the GPU thread. See
+                    _enqueue_frame's docstring for why this is call_soon_threadsafe
+                    + put_nowait rather than a blocking run_coroutine_threadsafe."""
                     _pkt_turn = pkt.get("turn_id")
                     reply_engine._mark_first_per_turn(
                         "server_audio_queue_enter", _pkt_turn,
@@ -3723,16 +3755,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             pending_audio_duration_s=round(audio_q.qsize() / float(args.fps), 3),
                             input_backlog_s=round(reply_engine.input_backlog_sec(), 3),
                         )
-                    fut = asyncio.run_coroutine_threadsafe(audio_q.put(pkt), event_loop)
-                    try:
-                        fut.result(timeout=FRAME_Q_PUT_TIMEOUT_S)
-                    except TimeoutError:
-                        print(
-                            f"[GPU] WARNING audio_q.put timeout frame={pkt.get('frame_number')}",
-                            flush=True,
-                        )
-                    except Exception as e:
-                        print(f"[GPU] WARNING audio_q.put failed: {e!r}", flush=True)
+                    event_loop.call_soon_threadsafe(_safe_put_nowait, audio_q, pkt, "audio_q")
 
                 if prebuffer_chunks <= 0 and not prebuffer_ready.is_set():
                     prebuffer_ready.set()
