@@ -252,6 +252,23 @@
     let opusEncoder = null, opusReady = false, opusPageCount = 0;
     let opusDecoder = null, opusDecoderReady = false, outputAudioCodec = "pcm";
     let outputWorklet = null, audioStreamTime = 0, audioQueuedSamples = 0;
+    // Forensic finding (conversation_log_5): the worklet's own ring buffer
+    // has NO active drain (its emergency-overflow drop is hardcoded off in
+    // audio-processor-aj-nodrop.js, since dropping samples to catch up is
+    // audible), so any burst of decoded audio handed to it immediately settles
+    // into a standing backlog that only shrinks by being played at 1x real
+    // time -- measured at a consistent ~1.1-1.2s gap between the server's own
+    // "gate open, start speaking" mark and the client actually drawing the
+    // corresponding frame (video draw is slaved to how much audio has
+    // actually been played, audioStreamTime). Fix: throttle HAND-OFF to the
+    // worklet from this main-thread queue instead, so no more than
+    // WORKLET_LOOKAHEAD_TARGET_MS of audio is ever resident in the worklet's
+    // uncapped buffer at once. This delays nothing that wasn't already
+    // delayed -- it only moves where the wait happens, from an invisible,
+    // unbounded buffer to a small, bounded one -- and drops or distorts
+    // nothing: every sample is still played, in order, gaplessly.
+    let pendingWorkletChunks = [];
+    const WORKLET_LOOKAHEAD_TARGET_MS = 350;
     let workletUnderruns = 0, workletOverflows = 0, workletDroppedSamples = 0;
     let decodedAudioDuration = 0;
     let pendingOpusPages = [];
@@ -415,14 +432,28 @@
       const samples = f32 instanceof Float32Array ? f32 : new Float32Array(f32);
       const copy = new Float32Array(samples);
       decodedAudioDuration += copy.length / audioCtx.sampleRate;
-      outputWorklet.port.postMessage(
-        {
-          type: "audio",
-          frame: copy,
-          micDuration: decodedAudioDuration,
-        },
-        [copy.buffer],
-      );
+      pendingWorkletChunks.push({ frame: copy, micDuration: decodedAudioDuration });
+      drainPendingWorkletChunks();
+    }
+
+    // Forwards queued chunks to the worklet only while its own reported
+    // buffer is below the lookahead target -- see WORKLET_LOOKAHEAD_TARGET_MS
+    // above. audioQueuedSamples is resynced from the worklet's real stats on
+    // every message (see outputWorklet.port.onmessage below); incrementing it
+    // here too keeps this loop from dumping the whole pending queue in one
+    // tick while waiting for that next real report to arrive. Under normal
+    // (no-backlog) conditions this forwards immediately, same as before.
+    function drainPendingWorkletChunks() {
+      if (!audioCtx || !outputWorklet) return;
+      const targetSamples = Math.round(WORKLET_LOOKAHEAD_TARGET_MS / 1000 * audioCtx.sampleRate);
+      while (pendingWorkletChunks.length && audioQueuedSamples < targetSamples) {
+        const item = pendingWorkletChunks.shift();
+        outputWorklet.port.postMessage(
+          { type: "audio", frame: item.frame, micDuration: item.micDuration },
+          [item.frame.buffer],
+        );
+        audioQueuedSamples += item.frame.length;
+      }
     }
 
     async function initOutputAudioWorklet() {
@@ -448,7 +479,12 @@
           return;
         }
         audioStreamTime = Math.max(0, Number(stats.streamTime || 0));
+        // Resync from the worklet's real, ground-truth buffer depth (our own
+        // running estimate in drainPendingWorkletChunks is only an interim
+        // guess between these reports), then top the worklet back up now that
+        // real playback has drained some of it -- see drainPendingWorkletChunks.
         audioQueuedSamples = Math.max(0, Number(stats.queuedSamples || 0));
+        drainPendingWorkletChunks();
         workletUnderruns = Math.max(0, Number(stats.underrunCount || 0));
         workletOverflows = Math.max(0, Number(stats.overflowCount || 0));
         workletDroppedSamples = Math.max(0, Number(stats.droppedSamples || 0));
@@ -1001,6 +1037,7 @@
       if (meterTimer) { clearInterval(meterTimer); meterTimer = null; }
       playbackCursor = 0; playbackStartTime = 0; audioStarted = false; frameStore = new Map();
       audioStreamTime = 0; audioQueuedSamples = 0; decodedAudioDuration = 0;
+      pendingWorkletChunks = [];
       frameCounter = 0; frameT0 = 0; sessionT0 = 0;
       lastRenderedFrame = -1; highestFrameReceived = -1;
       buffering = true; bufferStartTime = 0;
