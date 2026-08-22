@@ -3504,6 +3504,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         frames_sent = 0
         starvation_events = 0
         starve_start: float | None = None
+        # Forensic fix: unlike _audio_sender, this loop had NO catch-up bias
+        # at all -- it paced strictly at exactly 1/fps to send_start_wall+idx,
+        # so once frame_q fell behind (any GPU/render stall), it could only
+        # ever hold steady or grow, never shrink, for the rest of the session.
+        # Mirrors _audio_sender's mechanism: 20% faster than real time only
+        # while behind schedule (the max() below), reverting to exact 1/fps
+        # once caught up -- never speeds up video that isn't backlogged.
+        min_send_interval_s = max(0.001, 0.80 / float(args.fps))
+        next_send_wall = send_start_wall
         print(
             f"[AJ][VIDEO] connected session={session_id[:8]} "
             f"queued={frame_q.qsize()}",
@@ -3538,9 +3547,11 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
                 idx = int(packet["frame_number"])
                 target_t = send_start_wall + idx / float(args.fps)
+                target_t = max(target_t, next_send_wall)
                 sleep_s = target_t - time.perf_counter()
                 if sleep_s > 0:
                     await asyncio.sleep(sleep_s)
+                next_send_wall = max(target_t, time.perf_counter()) + min_send_interval_s
 
                 _pkt_turn = packet.get("turn_id")
                 if reply_engine is not None:
@@ -4248,11 +4259,23 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 send_start_wall = await _get_media_epoch()
                 packets_sent = 0
                 bytes_sent = 0
-                # AG: prevent catch-up bursts after GPU/render stalls.
-                # Even if target_t is already late, keep websocket audio writes
-                # spaced near the media frame cadence instead of flushing a
-                # backlog back-to-back into the browser decoder/worklet.
-                min_send_interval_s = max(0.001, 0.92 / float(args.fps))
+                # AG: prevent catch-up bursts after GPU/render stalls, while
+                # still actually draining backlog over time (see below) rather
+                # than free-running at full speed the instant it appears.
+                #
+                # Forensic finding (conversation_log_2/3/4): audio_q sits at a
+                # standing 17-40 packets (0.7-1.6s) essentially all the time,
+                # confirmed never to drain -- at the old 0.92 factor, catching
+                # up a 20-packet backlog takes ~12.5 packets sent per packet of
+                # backlog recovered, i.e. ~10 real seconds, far longer than a
+                # typical turn lasts, so in practice it never visibly shrinks.
+                # Raised to 0.80 (20% faster than real time while behind
+                # schedule, silently reverting to exact real-time once caught
+                # up -- see the max(target_t, next_send_wall) below) so a
+                # backlog actually drains within a few seconds instead of
+                # persisting indefinitely as a fixed floor under every turn's
+                # "user -> first avatar frame"/"actual audio playback" latency.
+                min_send_interval_s = max(0.001, 0.80 / float(args.fps))
                 next_send_wall = send_start_wall
 
                 while True:
