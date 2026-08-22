@@ -457,8 +457,20 @@ class LatencyLogger:
             m["user_to_first_avatar_frame_s"] = round(mk["avatar_first_frame_rendered"], 3)
         if "avatar_first_mouth_movement" in mk:
             m["user_to_first_mouth_movement_s"] = round(mk["avatar_first_mouth_movement"], 3)
+            m["user_to_first_mouth_movement_source"] = "server"
         elif "avatar_first_mouth_movement_client" in mk:
+            # The server-side gate transition never fired for this turn --
+            # almost always because the assistant_active gate was already
+            # held open from the tail of the PREVIOUS turn (no idle gap
+            # between turns), not because the avatar was actually slow.
+            # Falling back to the client-reported mark is the best available
+            # number, but flag its source explicitly: it is now clock-offset
+            # corrected (see mark_wall/clock_sync) rather than raw wall-clock,
+            # but it is still a one-time RTT estimate, not as certain as a
+            # direct perf_counter mark, and it was previously being presented
+            # with no distinction from the server-side case at all.
             m["user_to_first_mouth_movement_s"] = round(mk["avatar_first_mouth_movement_client"], 3)
+            m["user_to_first_mouth_movement_source"] = "client_fallback_no_gate_transition"
         if "first_meaningful_avatar_speech_frame" in mk:
             m["user_to_first_meaningful_avatar_speech_s"] = round(
                 mk["first_meaningful_avatar_speech_frame"], 3
@@ -617,7 +629,17 @@ class LatencyLogger:
             for field, label in HEADLINES:
                 if field in metrics:
                     any_headline = True
-                    lines.append(f"  {label:<48} {metrics[field]:7.3f}s")
+                    suffix = ""
+                    if field == "user_to_first_mouth_movement_s":
+                        src = metrics.get("user_to_first_mouth_movement_source")
+                        if src == "client_fallback_no_gate_transition":
+                            suffix = (
+                                "   [no server-side gate transition this turn -- "
+                                "gate was likely already open from the previous "
+                                "turn; falling back to the clock-corrected client "
+                                "mark, less certain than a direct server mark]"
+                            )
+                    lines.append(f"  {label:<48} {metrics[field]:7.3f}s{suffix}")
             if not any_headline:
                 lines.append("  (no headline deltas could be computed -- required marks missing)")
 

@@ -869,6 +869,21 @@
         let msg; try { msg = JSON.parse(event.data); } catch { return; }
 
         if (msg.type === "server_ready") {
+          // RTT-based clock-offset calibration: echo the server's send-time
+          // straight back with our own Date.now() so the server can estimate
+          // (client clock - server clock) via a standard NTP-style midpoint
+          // estimate. Without this, every client-reported latency mark
+          // (client_audio_receive, avatar_first_frame_rendered, etc.) was
+          // being merged assuming both clocks already agreed, which produced
+          // a fixed ~11-13s artifact on every turn -- see the server's
+          // "clock_sync" handler for the other half of this fix.
+          if (msg.t_server_epoch !== undefined && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "clock_sync",
+              t_server_epoch: msg.t_server_epoch,
+              t_client_recv_ms: Date.now(),
+            }));
+          }
           serverSR = Number(msg.sample_rate || 24000);
           outputAudioCodec = String(msg.output_audio_codec || "pcm");
           modelType = msg.model_type || "—";

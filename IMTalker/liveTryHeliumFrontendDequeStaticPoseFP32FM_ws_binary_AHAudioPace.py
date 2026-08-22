@@ -3622,10 +3622,24 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 "media_epoch": media_epoch,
                 "closed": False,
                 "created_at": time.perf_counter(),
+                # Estimated (client wall clock - server wall clock), seconds.
+                # 0.0 until a "clock_sync" reply comes back (see msg_type ==
+                # "clock_sync" below) -- every client_timing mark is corrected
+                # by this before being merged into a turn's latency block.
+                # Forensic finding: without this, "server -> client" and
+                # "user -> first avatar frame" showed a near-constant ~11-13s
+                # gap on EVERY turn regardless of answer length or network
+                # load -- the signature of a fixed clock offset (RunPod
+                # container clock vs. browser clock), not real transport time.
+                "clock_offset_s": 0.0,
             }
 
         await ws.send_json({
             "type": "server_ready",
+            # t=0 for the clock-sync RTT handshake the client performs
+            # immediately on receiving this message (see the "clock_sync"
+            # handler below and the client's onmessage for "server_ready").
+            "t_server_epoch": time.time(),
             "variant": (
                 "AJ-NETWORK-ISO-CACHED-FP32"
                 if os.environ.get("IMTALKER_CACHED_ENGINE", "0").strip().lower()
@@ -4465,14 +4479,45 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                     "chunks_done": avatar_chunk_id,
                                 })
 
+                elif msg_type == "clock_sync":
+                    # RTT-based clock-offset estimate, replacing the previous
+                    # "assume server and client share a wall clock" approach
+                    # that produced a near-constant ~11-13s "server -> client"
+                    # artifact on every turn (a fixed clock offset, not real
+                    # latency -- see the comment on split_sessions' initial
+                    # clock_offset_s above). Client echoes t_server_epoch (from
+                    # server_ready) back immediately along with its own
+                    # Date.now() reading; standard NTP-style offset estimate:
+                    # offset = t_client - (t_server_sent + rtt/2), i.e. the
+                    # client clock's reading at the midpoint of the round trip
+                    # minus what the server clock read when it sent the ping.
+                    # Best-effort: a bad/missing value just leaves the offset
+                    # at 0.0 (the old, unfixed behavior), never raises.
+                    try:
+                        t_server_sent = float(payload.get("t_server_epoch"))
+                        t_client_recv = float(payload.get("t_client_recv_ms")) / 1000.0
+                        t_server_now = time.time()
+                        rtt = max(0.0, t_server_now - t_server_sent)
+                        offset = t_client_recv - (t_server_sent + rtt / 2.0)
+                        session = split_sessions.get(session_id)
+                        if session is not None:
+                            session["clock_offset_s"] = offset
+                        print(
+                            f"[liveTryHeliumFM] clock_sync: rtt={rtt * 1000.0:.1f}ms "
+                            f"estimated_offset={offset * 1000.0:.1f}ms (client - server)",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+
                 elif msg_type == "client_timing":
                     # Best-effort client-reported wall-clock timestamp, merged
-                    # into this turn's latency block. See
-                    # LatencyLogger.mark_wall for the cross-clock caveat --
-                    # this assumes server and client share a wall clock
-                    # (same host or NTP-synced LAN), never presented as
-                    # precise as a server-side perf_counter mark. Malformed or
-                    # late messages (e.g. for a turn that already finished)
+                    # into this turn's latency block after correcting for the
+                    # clock_offset_s estimated above. See LatencyLogger.mark_wall
+                    # for the remaining caveat -- this is a one-time RTT
+                    # estimate, not a synchronized clock, so it removes the
+                    # fixed offset but not per-message network jitter. Malformed
+                    # or late messages (e.g. for a turn that already finished)
                     # must never affect the live pipeline.
                     try:
                         if reply_engine is not None:
@@ -4480,9 +4525,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             cli_event = str(payload.get("event", ""))
                             cli_t_wall_ms = payload.get("t_wall_ms")
                             if cli_turn_id is not None and cli_event and cli_t_wall_ms is not None:
+                                session = split_sessions.get(session_id) or {}
+                                offset = float(session.get("clock_offset_s", 0.0))
+                                corrected_s = float(cli_t_wall_ms) / 1000.0 - offset
                                 reply_engine.conv_logger.latency.mark_wall(
-                                    int(cli_turn_id), cli_event, float(cli_t_wall_ms) / 1000.0,
-                                    note="client wall-clock, merged best-effort",
+                                    int(cli_turn_id), cli_event, corrected_s,
+                                    note=(
+                                        f"client wall-clock, merged best-effort, "
+                                        f"clock_offset={offset * 1000.0:.0f}ms corrected"
+                                    ),
                                 )
                     except Exception:
                         pass
