@@ -1,0 +1,37 @@
+**/__pycache__/
+*.pyc
+.DS_Store
+
+**/checkpoints/
+**/exps/
+**/eval_results/
+**/results/
+**/tb_exports/
+**/preview_videos/
+step=*.mp4
+**/wandb/
+
+**/.ipynb_checkpoints/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.venv*/
+**/venv*/
+**/node_modules/
+
+# Runtime model artifacts. Download with scripts/download_live_assets.sh.
+checkpoints/
+IMTalker/checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.tar
+*.zst
+*.mp4
+*.wav
+# Live-pipeline asset, not a build artifact -- must stay tracked or the
+# RAG "thinking sound" silently has nothing to play on a fresh clone.
+!personaplex/ai-thinking-sound.wav
+*.npy
+*.npz
