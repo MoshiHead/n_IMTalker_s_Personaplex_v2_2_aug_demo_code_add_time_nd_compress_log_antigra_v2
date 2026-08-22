@@ -1572,9 +1572,18 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # was never captured there, so this is a closed gap, not a proven
         # root cause. On failure, search is disabled for the rest of this
         # session but the avatar keeps talking. --
+        # Real per-chunk cost of the STT/VAD forward pass, unconditionally
+        # measured (not gated to "the model is speaking" like the gen_lm/
+        # gen_audio_* stages below) -- this pass runs on every chunk whether
+        # idle or answering, so its cost has to be visible in the idle
+        # periods too if it's the thing pushing total_ms past the ~80ms
+        # real-time budget of one chunk. Logging-only: never gates behavior.
+        t_stt0 = time.perf_counter()
+        stt_step_ms = 0.0
         if self.stt_lm_gen is not None and not self.search_hard_disabled:
             try:
                 self._stt_step(chunk)
+                stt_step_ms = 1000.0 * (time.perf_counter() - t_stt0)
             except Exception as e:
                 tb = traceback.format_exc()
                 print(
@@ -1729,17 +1738,35 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             lat.accumulate(turn_id, "gen_lm", (t_lm1 - t_lm0))
             lat.accumulate(turn_id, "gen_audio_encode", (t_encode1 - t_encode0))
             lat.accumulate(turn_id, "gen_audio_decode", decode_ms / 1000.0)
+        # Unconditional (not gated to "the model is speaking"): the STT/VAD
+        # forward pass runs on every chunk, including the idle stepping
+        # BEFORE the user's speech-end fires this turn open, so gating it the
+        # same way as gen_lm/gen_audio_* above would hide exactly the cost
+        # this is meant to surface. Charged to whichever turn is currently
+        # open (or the previous one, during the idle tail before the next
+        # turn opens) purely for diagnostic visibility in the per-turn block.
+        if self._latency_turn_id is not None and stt_step_ms > 0.0:
+            self.conv_logger.latency.accumulate(
+                self._latency_turn_id, "stt_forward_per_chunk", stt_step_ms / 1000.0
+            )
 
         reply_i16 = np.clip(reply_pcm, -1.0, 1.0)
         reply_i16 = (reply_i16 * 32767.0).astype(np.int16)
         audio_b64 = base64.b64encode(reply_i16.tobytes()).decode("ascii")
 
+        # One Moshi step corresponds to one ~80ms real-time chunk; total_ms
+        # exceeding that is exactly what a standing input backlog is made of
+        # (see input_backlog_sec's docstring). Flagged inline so this is
+        # grep-able ("OVER_BUDGET") straight out of the console log instead
+        # of needing a separate analysis pass.
+        over_budget = " OVER_BUDGET" if total_ms > 80.0 else ""
         print(
             "[liveTryStudio] moshi "
             f"step={self.step} token={token} piece={token_piece!r} "
             f"in_rms={input_rms:.5f} reply_rms={reply_rms:.5f} peak={reply_peak:.3f} "
             f"hidden={helium_hidden is not None} "
-            f"encode={encode_ms:.1f}ms lm={lm_ms:.1f}ms decode={decode_ms:.1f}ms total={total_ms:.1f}ms",
+            f"encode={encode_ms:.1f}ms lm={lm_ms:.1f}ms decode={decode_ms:.1f}ms "
+            f"stt={stt_step_ms:.1f}ms total={total_ms:.1f}ms{over_budget}",
             flush=True,
         )
 

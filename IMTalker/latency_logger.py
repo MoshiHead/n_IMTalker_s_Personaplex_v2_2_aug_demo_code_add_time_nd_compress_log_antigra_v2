@@ -55,6 +55,7 @@ STAGE_LABELS: dict[str, str] = {
     "gen_audio_encode": "answer generation: Mimi input encode (GPU)",
     "avatar_motion": "avatar motion synthesis (Helium adapter + flow matching)",
     "avatar_render": "avatar render + JPEG encode",
+    "stt_forward_per_chunk": "STT/VAD forward pass (runs every chunk, idle or not)",
 }
 
 MARK_LABELS: dict[str, str] = {

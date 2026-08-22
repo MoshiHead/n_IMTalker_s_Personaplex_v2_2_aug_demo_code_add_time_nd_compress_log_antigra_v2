@@ -267,8 +267,8 @@ exec python -u "$SERVER_FILE" \
   --prebuffer_chunks 1 \
   --render_sub_batch 8 \
   --renderer_precision fp32 \
-  --frame_q_backpressure "${FRAME_Q_BACKPRESSURE:-8}" \
-  --audio_q_backpressure "${AUDIO_Q_BACKPRESSURE:-8}" \
+  --frame_q_backpressure "${FRAME_Q_BACKPRESSURE:-32}" \
+  --audio_q_backpressure "${AUDIO_Q_BACKPRESSURE:-96}" \
   --buffer_ms 160 \
   --skip_fm_audio_encoder \
   --assistant_speech_rms_threshold "${ASSISTANT_SPEECH_RMS_THRESHOLD:-0.006}" \
