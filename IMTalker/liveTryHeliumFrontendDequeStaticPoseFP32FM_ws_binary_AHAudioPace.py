@@ -252,28 +252,15 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 
         self._install_graph_hidden_capture()
 
-        # Profiling finding: the STT/VAD forward pass (self._stt_step) is a
-        # SEPARATE model from the main Moshi/render pipeline -- own weights,
-        # own streaming state, same input audio -- but was run strictly
-        # serially inside _step(), adding directly to every chunk's wall-clock
-        # cost (measured 1.1-2.6s per turn, 12-19% of turn time, on top of the
-        # main pipeline). Since it does not depend on the main pipeline's
-        # output for the SAME chunk, its GPU work can run concurrently with
-        # it on a separate CUDA stream instead of blocking the critical path.
-        # See _step()'s "PROFILING FIX" comment for the full synchronization
-        # design (why this is safe: single dedicated worker thread, strict
-        # one-in-flight ordering, explicit no_grad + stream sync boundaries).
-        self._stt_cuda_stream = (
-            torch.cuda.Stream(device=self.device)
-            if torch.cuda.is_available() and self.stt_lm_gen is not None
-            else None
-        )
-        self._stt_executor = (
-            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt-overlap")
-            if self._stt_cuda_stream is not None
-            else None
-        )
-        self._pending_stt_future: concurrent.futures.Future | None = None
+        # REVERTED: a prior attempt at overlapping the STT forward pass on a
+        # separate CUDA stream (see git history / prior comment here) crashed
+        # every session with "CUDA error: operation not permitted when stream
+        # is capturing". Root cause: _install_graph_hidden_capture above puts
+        # the main LM step under CUDA graph capture/replay, and CUDA graphs
+        # forbid ANY other stream from doing concurrent, non-captured work
+        # for the whole process while capture is active -- this is a hard
+        # incompatibility, not a tunable race condition, so STT must stay on
+        # the main stream, run inline like every other per-chunk step.
 
     def _next_thinking_sound_chunk(self) -> np.ndarray:
         """Next MIMI_FRAME_SIZE samples of the thinking sound, looping
@@ -573,21 +560,6 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     _step_supports_text_token = False
 
     def reset_session(self) -> None:
-        # This engine instance is a reused singleton across WS reconnects (see
-        # get_moshi_engine). If the previous connection dropped mid-chunk, its
-        # background STT future (see _dispatch_stt_step/_join_stt_step) could
-        # still be running -- drain it here, before any of the state below is
-        # reset, so it can never be joined/attributed against the NEW session,
-        # and so its (harmless, already-stale) result doesn't race with the
-        # fresh self.stt_*/self.search_* state this method is about to set.
-        pending = getattr(self, "_pending_stt_future", None)
-        if pending is not None:
-            try:
-                pending.result(timeout=5.0)
-            except Exception:
-                pass
-            self._pending_stt_future = None
-
         # A session that ends (or is restarted by a reconnect) with a turn still
         # in flight would otherwise never have its latency block written -- the
         # block is normally emitted when the NEXT question arrives, and for the
@@ -729,89 +701,6 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 text_token=tok,
                 input_tokens=self.lm_gen._encode_sine_frame(),
             )
-
-    def _dispatch_stt_step(self, chunk: torch.Tensor) -> None:
-        """Kick off this chunk's STT/VAD forward pass on the dedicated
-        background thread + CUDA stream, WITHOUT waiting for it. Must be
-        followed by exactly one _join_stt_step() call before the NEXT chunk's
-        _dispatch_stt_step -- see _step()'s "PROFILING FIX" comment for the
-        full design. No-op (self._pending_stt_future stays None) if STT is
-        not configured, disabled, or CUDA/the stream/executor are unavailable
-        -- in every one of those cases _step() falls back to running
-        _stt_step() inline exactly as before, so the plain conversational
-        (no-search) path and any non-CUDA/CPU-only launch are untouched."""
-        self._pending_stt_future = None
-        if self.stt_lm_gen is None or self.search_hard_disabled:
-            return
-        if self._stt_cuda_stream is None or self._stt_executor is None:
-            # No overlap possible (CPU-only, or STT wasn't configured when
-            # the stream/executor were set up) -- run inline, synchronously,
-            # exactly like the original code did. _join_stt_step() will see
-            # the None future and skip straight to reading these results.
-            t0 = time.perf_counter()
-            try:
-                self._stt_step(chunk)
-                self._stt_inline_result = (1000.0 * (time.perf_counter() - t0), None)
-            except Exception as e:  # noqa: BLE001 - re-raised by _join_stt_step
-                self._stt_inline_result = (0.0, e)
-            return
-
-        def _run() -> float:
-            # torch.no_grad() is a THREAD-LOCAL context manager in PyTorch --
-            # it does NOT carry over from the thread that entered it (the GPU
-            # producer thread's @torch.no_grad() on _step does not apply
-            # here), so it must be re-entered explicitly on this worker
-            # thread. Without this, the STT forward pass would build an
-            # autograd graph it will never use, leaking GPU memory every
-            # single chunk for the life of the session.
-            t0 = time.perf_counter()
-            with torch.no_grad(), torch.cuda.stream(self._stt_cuda_stream):
-                self._stt_step(chunk)
-            # Block THIS worker thread (not the GPU producer thread) until
-            # every kernel queued on the STT stream has actually finished,
-            # so the result is guaranteed complete and self.stt_* state is
-            # fully updated by the time _join_stt_step's .result() returns.
-            self._stt_cuda_stream.synchronize()
-            return 1000.0 * (time.perf_counter() - t0)
-
-        self._pending_stt_future = self._stt_executor.submit(_run)
-
-    def _join_stt_step(self) -> float:
-        """Wait for the chunk dispatched by the most recent _dispatch_stt_step
-        to finish, apply the exact same on-failure behavior the old inline
-        try/except had (disable search for the rest of the session), and
-        return the elapsed STT time in ms (0.0 if STT is not configured/
-        disabled/failed). Must be called exactly once per _step() call,
-        before the NEXT chunk's _dispatch_stt_step -- this is what guarantees
-        only ever one STT chunk is in flight at a time, so self.stt_*/
-        self.search_* instance state is never touched by two chunks at once."""
-        fut = self._pending_stt_future
-        self._pending_stt_future = None
-        if fut is None:
-            # Either STT is off/disabled, or we ran inline above (CPU-only
-            # path) -- pull that result instead.
-            elapsed_ms, err = getattr(self, "_stt_inline_result", (0.0, None))
-            self._stt_inline_result = (0.0, None)
-            if err is None:
-                return elapsed_ms
-            e = err
-            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        else:
-            try:
-                return fut.result()
-            except Exception as e:  # noqa: BLE001
-                tb = traceback.format_exc()
-        print(
-            f"[liveTryPlasticity][search] _stt_step failed, disabling search "
-            f"for the rest of this session: {e!r}\n{tb}",
-            flush=True,
-        )
-        self.conv_logger.error("stt_step", e, tb)
-        self.search_hard_disabled = True
-        self.search_awaiting_ref = False
-        self.search_thinking_active = False
-        self.suppress_text_until_ref = False
-        return 0.0
 
     def _stt_step(self, chunk: torch.Tensor) -> None:
         """Run the separate STT/VAD submodel one 80ms frame forward (same GPU
@@ -1678,36 +1567,53 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self.mimi.reset_streaming()
             self.skip_first = False
 
-        # PROFILING FIX: the STT/VAD forward pass used to run strictly serially
-        # here, blocking the main pipeline -- measured at 1.1-2.6s per turn
-        # (12-19% of turn wall time) directly added to every chunk's cost,
-        # on top of the main Moshi/render pipeline, with no equivalent in the
-        # reference (no-STT) pipeline. It is a separate model (own weights,
-        # own streaming state) reading the SAME input chunk, so its GPU work
-        # does not need to block the main pipeline's own work for this chunk.
+        # -- STT/VAD forward pass + turn-boundary detection, then consume any
+        # in-flight routing/search result. No-op (both guards false) unless
+        # --stt_hf_repo/--stt_pkg_dir were configured at launch, so the plain
+        # conversational path is untouched.
         #
-        # Dispatched here (non-blocking, see _dispatch_stt_step), joined just
-        # before it's needed for logging near the end of this function (see
-        # _join_stt_step) -- everything in between (the LM forward pass and
-        # Mimi decode below) now overlaps with it on a separate CUDA stream
-        # instead of waiting for it first.
+        # REVERTED (see __init__): STT must run inline, on the main stream,
+        # like every other per-chunk step here -- an attempt to overlap it on
+        # a separate CUDA stream crashed every session with "CUDA error:
+        # operation not permitted when stream is capturing", because the main
+        # LM step above runs under CUDA graph capture/replay, which forbids
+        # any other stream from doing concurrent work for the whole process
+        # while capture is active. Hard incompatibility, not tunable.
         #
-        # _consume_pending() is moved to run BEFORE this dispatch (using the
-        # PREVIOUS chunk's fully-joined STT state, not this one) so its data
-        # dependency ordering is unchanged from before -- this chunk's own
-        # STT side effects (e.g. a VAD-fired turn open) become visible to
-        # _consume_pending on the NEXT chunk, a bounded, harmless ~80ms delay
-        # (the router's own decision cycle is already hundreds of ms). This
-        # reordering is what makes the overlap possible: _consume_pending
-        # would otherwise need this chunk's STT result immediately, leaving
-        # nothing to overlap with.
-        #
-        # Uncaught-exception safety is unchanged: _join_stt_step re-raises via
-        # Future.result() and disables search for the rest of the session on
-        # failure, exactly like the original inline try/except (see
-        # conversation_logs_4's silent-pipeline-death forensic note, still
-        # relevant -- an uncaught exception here must never propagate out of
-        # _step() and kill the GPU producer thread).
+        # Both calls run inside try/except: this hook runs on every single
+        # chunk of the live conversation, so an uncaught exception here would
+        # otherwise propagate out of _step() and kill the entire GPU producer
+        # thread -- audio and video generation stop forever, with nothing
+        # captured in either conversation log. That failure signature (log
+        # ends mid-turn, no error line, no further component_status entries)
+        # matches what conversation_logs_4 shows, though the exact exception
+        # was never captured there, so this is a closed gap, not a proven
+        # root cause. On failure, search is disabled for the rest of this
+        # session but the avatar keeps talking. --
+        # Real per-chunk cost of the STT/VAD forward pass, unconditionally
+        # measured (not gated to "the model is speaking" like the gen_lm/
+        # gen_audio_* stages below) -- this pass runs on every chunk whether
+        # idle or answering, so its cost has to be visible in the idle
+        # periods too if it's the thing pushing total_ms past the ~80ms
+        # real-time budget of one chunk. Logging-only: never gates behavior.
+        t_stt0 = time.perf_counter()
+        stt_step_ms = 0.0
+        if self.stt_lm_gen is not None and not self.search_hard_disabled:
+            try:
+                self._stt_step(chunk)
+                stt_step_ms = 1000.0 * (time.perf_counter() - t_stt0)
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(
+                    f"[liveTryPlasticity][search] _stt_step failed, disabling search "
+                    f"for the rest of this session: {e!r}\n{tb}",
+                    flush=True,
+                )
+                self.conv_logger.error("stt_step", e, tb)
+                self.search_hard_disabled = True
+                self.search_awaiting_ref = False
+                self.search_thinking_active = False
+                self.suppress_text_until_ref = False
         if self.search_awaiting_ref and not self.search_hard_disabled:
             try:
                 self._consume_pending()
@@ -1723,7 +1629,6 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.search_awaiting_ref = False
                 self.search_thinking_active = False
                 self.suppress_text_until_ref = False
-        self._dispatch_stt_step(chunk)
 
         # While a search is in flight, hand the model its own "say nothing"
         # token instead of letting it sample text. process_transformer_output
@@ -1824,17 +1729,6 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         if self.search_thinking_active and self.thinking_sound_pcm is not None:
             reply_pcm = self._next_thinking_sound_chunk()
             force_idle = True
-
-        # Join point for the STT chunk dispatched near the top of this
-        # function (see the "PROFILING FIX" comment there) -- everything
-        # above (consume_pending on the previous chunk's state, the LM
-        # forward pass, Mimi decode, the RMS/first-word gate, the
-        # thinking-sound swap) has been running concurrently with it. This is
-        # the latest safe point to wait: nothing after this line reads
-        # self.stt_*/self.search_* state, and _step() must not return with
-        # this chunk's STT still in flight (the next call's dispatch would
-        # then race with it on that shared state).
-        stt_step_ms = self._join_stt_step()
 
         reply_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
         reply_peak = float(np.max(np.abs(reply_pcm))) if reply_pcm.size else 0.0
